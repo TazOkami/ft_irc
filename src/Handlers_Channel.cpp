@@ -25,7 +25,7 @@ void Server::sendNames(int fd, Channel& ch) {
     queueLine(fd, ":" + serverName + " " + RPL_ENDOFNAMES + " " + nick + " " + ch.name + " :End of /NAMES list.");
 }
 
-// Broadcast a fully formed IRC line to every member except an optional sender.
+// Broadcast a fully formed IRC line to every member (-1) except an optional sender.
 void Server::broadcast(const std::set<int>& targets, int excludeFd, const std::string& line) {
     for (std::set<int>::const_iterator it=targets.begin(); it!=targets.end(); ++it) {
         if (*it == excludeFd) continue;
