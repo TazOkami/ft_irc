@@ -1,34 +1,43 @@
 #include "Utils.hpp"
-#include <algorithm>
 #include <cctype>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <fcntl.h>
-#include <unistd.h>
 
-// Return a lowercase copy of the provided ASCII string for case-insensitive lookups.
+// Lowercase helper (ASCII).
 std::string toLower(const std::string& s) {
-    std::string r = s;
-    for (size_t i=0;i<r.size();++i) r[i] = (char)std::tolower(r[i]);
-    return r;
+	std::string r = s;
+	for (size_t i=0;i<r.size();++i) r[i] = (char)std::tolower(static_cast<unsigned char>(r[i]));
+	return r;
 }
 
-// Trim leading/trailing spaces, tabs, and CR characters when sanitizing input tokens.
+// Trim spaces/tabs/CR.
 std::string trim(const std::string& s) {
-    size_t a = 0, b = s.size();
-    while (a<b && (s[a]==' ' || s[a]=='\t' || s[a]=='\r')) ++a;
-    while (b>a && (s[b-1]==' ' || s[b-1]=='\t' || s[b-1]=='\r')) --b;
-    return s.substr(a, b-a);
+	size_t a = 0, b = s.size();
+	while (a<b && (s[a]==' ' || s[a]=='\t' || s[a]=='\r')) ++a;
+	while (b>a && (s[b-1]==' ' || s[b-1]=='\t' || s[b-1]=='\r')) --b;
+	return s.substr(a, b-a);
 }
 
-// Check if the token looks like a channel (leading '#', as mandated by the subject).
+// Channel name check (starts with '#', no spaces/commas/colons, length >= 2).
 bool isChannelName(const std::string& s) {
-    return !s.empty() && s[0] == '#';
+	if (s.size() < 2 || s[0] != '#') return false;
+	for (size_t i = 1; i < s.size(); ++i) {
+		unsigned char c = static_cast<unsigned char>(s[i]);
+		if (c <= 0x20 || c == 0x7F) return false;
+		if (c == ',' || c == ':' || c == 0x07) return false;
+	}
+	return true;
 }
 
-// Put the descriptor into non-blocking mode using fcntl, the project-mandated approach.
+// Set non-blocking.
 bool setNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return false;
-    return (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+	return (fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+}
+
+// Format time for IRC welcome.
+std::string formatTime(std::time_t t) {
+	char buf[64];
+	std::tm* tm = std::localtime(&t);
+	if (!tm) return "unknown";
+	if (std::strftime(buf, sizeof(buf), "%a %b %d %H:%M:%S %Y %Z", tm) == 0) return "unknown";
+	return std::string(buf);
 }

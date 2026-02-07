@@ -3,22 +3,21 @@
 
 #include "Types.hpp"
 
-//État d'un utilisateur connecté
 struct Client {
-    std::string readBuf;
-    std::string writeBuf;
+	std::string readBuf;
+	std::string writeBuf;
 
-    std::string nick;
-    std::string user;
-    std::string pass;
-    std::string realname;		//(optionnel, affiché avec /whois)
+	std::string nick;
+	std::string user;
+	std::string pass;
+	std::string realname;
 
-    bool hasPass;
-    bool registered;
-    bool closed;
-    bool pausedRead;
+	bool hasPass;
+	bool registered;
+	bool closed;
+	bool pausedRead;
 
-    Client() : hasPass(false), registered(false), closed(false), pausedRead(false) {}
+	Client() : hasPass(false), registered(false), closed(false), pausedRead(false) {}
 };
 
 #endif

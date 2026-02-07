@@ -1,124 +1,154 @@
 #include "Server.hpp"
 #include "Numerics.hpp"
 #include "Utils.hpp"
-#include "Parser.hpp"
-#include <sstream>
+#include "Handlers_Utils.hpp"
 
+// JOIN handler.
+void Server::h_JOIN(int fd, const std::vector<std::string>& params) {
+	std::string me = clients[fd].nick.empty() ? "*" : clients[fd].nick;
+	if (params.empty()) { sendNumeric(fd, ERR_NEEDMOREPARAMS, me + " JOIN", "Not enough parameters"); return; }
+	if (params[0] == "0") {
+		std::vector<std::string> toLeave;
+		for (std::map<std::string,Channel>::iterator it = channels.begin(); it != channels.end(); ++it) {
+			if (it->second.members.count(fd)) toLeave.push_back(it->first);
+		}
+		for (size_t i = 0; i < toLeave.size(); ++i) {
+			const std::string& name = toLeave[i];
+			Channel &ch = channels[name];
+			std::string msg = prefixFor(fd) + " PART " + name + " :leaving";
+			broadcast(ch.members, -1, msg);
+			ch.members.erase(fd);
+			ch.ops.erase(fd);
+			if (ch.members.empty()) channels.erase(name);
+		}
+		return;
+	}
 
+	std::vector<std::string> names = splitComma(params[0]);
+	std::vector<std::string> keys;
+	if (params.size() >= 2) keys = splitComma(params[1]);
 
-// Send a numeric reply with the standard server prefix and nickname target.
-void Server::sendNumeric(int fd, const std::string& code, const std::string& target, const std::string& text) {
-    queueLine(fd, ":" + serverName + " " + code + " " + (target.empty()?"*":target) + " :" + text);
+	for (size_t i = 0; i < names.size(); ++i) {
+		std::string name = names[i];
+		std::string key  = (i < keys.size()) ? keys[i] : "";
+
+		if (!isChannelName(name)) { sendNumeric(fd, ERR_NOSUCHCHANNEL, me + " " + name, "Illegal channel name"); continue; }
+		Channel &ch = getOrCreateChan(name);
+
+		Client &c = clients[fd];
+		if (ch.members.count(fd)) {
+			sendNumeric(fd, ERR_USERONCHANNEL, me + " " + me + " " + name, "is already on channel");
+			continue;
+		}
+		if (ch.inviteOnly && ch.invited.count(toLower(c.nick)) == 0) {
+			sendNumeric(fd, ERR_INVITEONLYCHAN, me + " " + name, "Cannot join channel (+i)"); continue;
+		}
+		if (ch.hasKey && ch.key != key) {
+			sendNumeric(fd, ERR_BADCHANNELKEY, me + " " + name, "Cannot join channel (+k)"); continue;
+		}
+		if (ch.hasLimit && (int)ch.members.size() >= ch.limit) {
+			sendNumeric(fd, ERR_CHANNELISFULL, me + " " + name, "Cannot join channel (+l)");
+			continue;
+		}
+		bool wasEmpty = ch.members.empty();
+		ch.members.insert(fd);
+		ch.invited.erase(toLower(c.nick));
+		if (wasEmpty) ch.ops.insert(fd);
+
+		std::string line = prefixFor(fd) + " JOIN " + name;
+		broadcast(ch.members, -1, line);
+		if (ch.topic.empty()) queueLine(fd, ":" + serverName + " " + RPL_NOTOPIC + " " + c.nick + " " + name + " :No topic is set");
+		else                  queueLine(fd, ":" + serverName + " " + RPL_TOPIC   + " " + c.nick + " " + name + " :" + ch.topic);
+		sendNames(fd, ch);
+	}
 }
 
-// Check whether a lowercase nickname is already bound to a client fd.
-bool Server::nickInUse(const std::string& nick) const {
-    return nickToFd.find(toLower(nick)) != nickToFd.end();
-}
-
-// Update a client's nickname, enforcing uniqueness and refreshing lookup maps.
-void Server::setNick(int fd, const std::string& nick) {
-    if (nick.empty()) { sendNumeric(fd, ERR_NONICKNAMEGIVEN, "*", "No nickname given"); return; }
-    if (nickInUse(nick)) { sendNumeric(fd, ERR_NICKNAMEINUSE, "*", nick + " :Nickname is already in use"); return; }
-
-    Client &c = clients[fd];
-    if (!c.nick.empty()) nickToFd.erase(toLower(c.nick));
-    c.nick = nick;
-    nickToFd[toLower(nick)] = fd;
-}
-
-// Build the nick!user@host prefix expected by downstream handlers.
-std::string Server::prefixFor(int fd) const {
-    std::map<int, Client>::const_iterator it = clients.find(fd);
-    std::string nick = (it==clients.end() || it->second.nick.empty()) ? "unknown" : it->second.nick;
-    std::string user = (it==clients.end() || it->second.user.empty()) ? "user" : it->second.user;
-    return ":" + nick + "!" + user + "@" + serverName;
-}
-
-// Complete registration once PASS/NICK/USER are set, sending 001/002/003 numerics.
-void Server::maybeWelcome(int fd) {
-    Client &c = clients[fd];
-    if (!password.empty() && !c.hasPass) return;
-    if (!c.registered && !c.nick.empty() && !c.user.empty()) {
-        c.registered = true;
-        sendNumeric(fd, RPL_WELCOME, c.nick, "Welcome to " + serverName + ", " + c.nick + "!" + c.user + "@" + serverName);
-        sendNumeric(fd, RPL_YOURHOST, c.nick, "Your host is " + serverName + ", running 0.1");
-        sendNumeric(fd, RPL_CREATED, c.nick, "This server was created just now");
-        queueLine(fd, ":" + serverName + " " + RPL_MYINFO + " " + c.nick + " " + serverName + " 0.1 o o");
-    }
-}
-
-// Minimal CAP handler to satisfy clients that probe for IRCv3 capabilities.
-void Server::h_CAP(int fd, const std::vector<std::string>& params, const std::string& trailing) {
-    std::string nick = clients[fd].nick.empty() ? "*" : clients[fd].nick;
-    if (!params.empty()) {
-        std::string sub = toLower(params[0]);
-        if (sub == "ls") {
-            queueLine(fd, ":" + serverName + " CAP " + nick + " LS :");
-            return;
-        } else if (sub == "req") {
-            queueLine(fd, ":" + serverName + " CAP " + nick + " NAK :" + trailing);
-            return;
-        } else if (sub == "end") {
-            return;
-        }
-    }
-    queueLine(fd, ":" + serverName + " CAP " + nick + " LS :");
-}
-
-// Store the PASS value, mark hasPass when valid, and block other commands otherwise.
-void Server::h_PASS(int fd, const std::vector<std::string>& params) {
-    if (params.empty()) { sendNumeric(fd, ERR_NEEDMOREPARAMS, "*", "PASS :Not enough parameters"); return; }
-    Client &c = clients[fd];
-    if (c.registered) { sendNumeric(fd, ERR_ALREADYREGISTRED, "*", "You may not reregister"); return; }
-    c.pass = params[0];
-    if (password.empty() || c.pass == password) c.hasPass = true;
-    else sendNumeric(fd, ERR_PASSWDMISMATCH, "*", "Password incorrect");
-}
-
-// Apply the requested nickname and trigger registration completion if possible.
-void Server::h_NICK(int fd, const std::vector<std::string>& params) {
-    if (params.empty()) { sendNumeric(fd, ERR_NONICKNAMEGIVEN, "*", "No nickname given"); return; }
-    setNick(fd, params[0]);
-    maybeWelcome(fd);
-}
-
-// Capture username/realname data and trigger registration completion if possible.
-void Server::h_USER(int fd, const std::vector<std::string>& params, const std::string& trailing) {
-    if (params.size() < 3) { sendNumeric(fd, ERR_NEEDMOREPARAMS, "*", "USER :Not enough parameters"); return; }
-    Client &c = clients[fd];
-    if (c.registered) { sendNumeric(fd, ERR_ALREADYREGISTRED, "*", "You may not reregister"); return; }
-    c.user = params[0];
-    c.realname = trailing;
-    maybeWelcome(fd);
-}
-
-// Reply to PING probes to keep the connection alive and reassure clients.
-void Server::h_PING(int fd, const std::vector<std::string>& params, const std::string& trailing) {
-    std::string token = trailing.empty() ? (params.empty() ? "keepalive" : params[0]) : trailing;
-    queueLine(fd, ":" + serverName + " PONG " + serverName + " :" + token);
-}
-
-// Close the connection, notifying peers of the quit reason.
-void Server::h_QUIT(int fd, const std::string& trailing) {
-    disconnect(fd, trailing.empty() ? "quit" : trailing);
-}
-
-// Deliver PRIVMSG payloads to channels or directly addressed users with error checks.
+// PRIVMSG handler.
 void Server::h_PRIVMSG(int fd, const std::vector<std::string>& params, const std::string& trailing) {
-    if (params.empty()) { sendNumeric(fd, ERR_NORECIPIENT, "*", "No recipient given (PRIVMSG)"); return; }
-    if (trailing.empty()) { sendNumeric(fd, ERR_NOTEXTTOSEND, "*", "No text to send"); return; }
-    std::string target = params[0];
-    std::string msg = prefixFor(fd) + " PRIVMSG " + target + " :" + trailing;
+	std::string me = clients[fd].nick.empty() ? "*" : clients[fd].nick;
+	if (params.empty()) { sendNumeric(fd, ERR_NORECIPIENT, me, "No recipient given (PRIVMSG)"); return; }
+	if (trailing.empty()) { sendNumeric(fd, ERR_NOTEXTTOSEND, me, "No text to send"); return; }
+	std::string target = params[0];
+	std::string msg = prefixFor(fd) + " PRIVMSG " + target + " :" + trailing;
 
-    if (isChannelName(target)) {
-        if (channels.find(target) == channels.end()) { sendNumeric(fd, ERR_NOSUCHCHANNEL, target, "No such channel"); return; }
-        Channel &ch = channels[target];
-        if (ch.members.count(fd) == 0) { sendNumeric(fd, ERR_NOTONCHANNEL, target, "You're not on that channel"); return; }
-        broadcast(ch.members, fd, msg);
-    } else {
-        std::map<std::string,int>::iterator it = nickToFd.find(toLower(target));
-        if (it == nickToFd.end()) { sendNumeric(fd, ERR_NOSUCHNICK, target, "No such nick"); return; }
-        queueLine(it->second, msg);
-    }
+	if (isChannelName(target)) {
+		if (channels.find(target) == channels.end()) { sendNumeric(fd, ERR_NOSUCHCHANNEL, me + " " + target, "No such channel"); return; }
+		Channel &ch = channels[target];
+		if (ch.members.count(fd) == 0 && ch.noExternal) {
+			sendNumeric(fd, ERR_CANNOTSENDTOCHAN, me + " " + target, "Cannot send to channel");
+			return;
+		}
+		broadcast(ch.members, fd, msg);
+	} else {
+		std::map<std::string,int>::iterator it = nickToFd.find(toLower(target));
+		if (it == nickToFd.end()) { sendNumeric(fd, ERR_NOSUCHNICK, me + " " + target, "No such nick"); return; }
+		queueLine(it->second, msg);
+	}
+}
+
+// TOPIC handler.
+void Server::h_TOPIC(int fd, const std::vector<std::string>& params, const std::string& trailing, bool hasTrailing) {
+	std::string me = clients[fd].nick.empty() ? "*" : clients[fd].nick;
+	if (params.empty()) { sendNumeric(fd, ERR_NEEDMOREPARAMS, me + " TOPIC", "Not enough parameters"); return; }
+	std::string name = params[0];
+	if (channels.find(name) == channels.end()) { sendNumeric(fd, ERR_NOSUCHCHANNEL, me + " " + name, "No such channel"); return; }
+	Channel &ch = channels[name];
+
+	if (!hasTrailing) {
+		if (ch.topic.empty()) queueLine(fd, ":" + serverName + " " + RPL_NOTOPIC + " " + me + " " + name + " :No topic is set");
+		else queueLine(fd, ":" + serverName + " " + RPL_TOPIC + " " + me + " " + name + " :" + ch.topic);
+		return;
+	} // Setting a new topic
+	if (!ch.members.count(fd)) { sendNumeric(fd, ERR_NOTONCHANNEL, me + " " + name, "You're not on that channel"); return; } // New check
+	if (ch.topicOpOnly && ch.ops.count(fd) == 0) { sendNumeric(fd, ERR_CHANOPRIVSNEEDED, me + " " + name, "You're not channel operator"); return; }
+
+	ch.topic = trailing;
+	std::string msg = prefixFor(fd) + " TOPIC " + name + " :" + ch.topic;
+	broadcast(ch.members, -1, msg);
+}
+
+// INVITE handler.
+void Server::h_INVITE(int fd, const std::vector<std::string>& params) {
+	std::string me = clients[fd].nick.empty() ? "*" : clients[fd].nick;
+	if (params.size() < 2) { sendNumeric(fd, ERR_NEEDMOREPARAMS, me + " INVITE", "Not enough parameters"); return; }
+	std::string nick = params[0];
+	std::string name = params[1];
+	std::map<std::string,int>::iterator it = nickToFd.find(toLower(nick));
+	if (it == nickToFd.end()) { sendNumeric(fd, ERR_NOSUCHNICK, me + " " + nick, "No such nick"); return; }
+
+	if (channels.find(name) != channels.end()) {
+		Channel &ch = channels[name];
+		if (!ch.members.count(fd)) { sendNumeric(fd, ERR_NOTONCHANNEL, me + " " + name, "You're not on that channel"); return; }
+		if (ch.members.count(it->second)) { sendNumeric(fd, ERR_USERONCHANNEL, me + " " + nick + " " + name, "is already on channel"); return; }
+		if (ch.inviteOnly && ch.ops.count(fd) == 0) { sendNumeric(fd, ERR_CHANOPRIVSNEEDED, me + " " + name, "You're not channel operator"); return; }
+		ch.invited.insert(toLower(nick));
+	}
+
+	queueLine(it->second, prefixFor(fd) + " INVITE " + nick + " :" + name);
+	queueLine(fd, ":" + serverName + " " + RPL_INVITING + " " + me + " " + nick + " " + name);
+}
+
+// KICK handler.
+void Server::h_KICK(int fd, const std::vector<std::string>& params, const std::string& trailing) {
+	std::string me = clients[fd].nick.empty() ? "*" : clients[fd].nick;
+	if (params.size() < 2) { sendNumeric(fd, ERR_NEEDMOREPARAMS, me + " KICK", "Not enough parameters"); return; }
+	std::string name = params[0];
+	std::string nick = params[1];
+	if (channels.find(name) == channels.end()) { sendNumeric(fd, ERR_NOSUCHCHANNEL, me + " " + name, "No such channel"); return; }
+	Channel &ch = channels[name];
+	if (ch.ops.count(fd) == 0) { sendNumeric(fd, ERR_CHANOPRIVSNEEDED, me + " " + name, "You're not channel operator"); return; }
+
+	std::map<std::string,int>::iterator it = nickToFd.find(toLower(nick));
+	if (it == nickToFd.end() || ch.members.count(it->second) == 0) {
+		sendNumeric(fd, ERR_USERNOTINCHANNEL, me + " " + nick + " " + name, "They aren't on that channel");
+		return;
+	}
+	int vfd = it->second;
+	std::string reason = trailing.empty() ? "kicked" : trailing;
+	std::string msg = prefixFor(fd) + " KICK " + name + " " + nick + " :" + reason;
+	broadcast(ch.members, -1, msg);
+
+	ch.members.erase(vfd);
+	ch.ops.erase(vfd);
+	if (ch.members.empty()) channels.erase(name);
 }
